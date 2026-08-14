@@ -1,67 +1,82 @@
 # =====================================================
 # Safdar Firmware Toolkit Pro
-# Version : 0.1.1
-# File    : firmware.py
+# Version : 0.3.0
+# File    : core/firmware.py
+# Author  : Safdar Ali
 # =====================================================
 
-from pathlib import Path
+"""
+Firmware Buffer & Image Handling Engine.
+Handles safe binary reading, flash entropy/density metrics,
+and byte slice extractions.
+"""
+
+import os
+from typing import Optional
+from core.constants import FLASH_SIZES
 
 
 class FirmwareImage:
     """
-    Handles loading and basic information about a firmware image.
+    Encapsulates raw SPI BIOS binary buffers and provides
+    low-level memory inspection and density metrics.
     """
 
-    def __init__(self, filename):
-
-        self.filename = filename
-        self.path = Path(filename)
-
-        self.data = b""
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.name = os.path.basename(file_path)
         self.size = 0
+        self.data = b""
+        self.is_loaded = False
 
-    def load(self):
+    def load(self) -> bool:
+        """
+        Loads binary file data into memory buffer safely.
+        """
+        if not os.path.exists(self.file_path):
+            raise FileNotFoundError(f"Firmware binary not found: {self.file_path}")
 
-        self.data = self.path.read_bytes()
-        self.size = len(self.data)
+        self.size = os.path.getsize(self.file_path)
+        
+        with open(self.file_path, "rb") as f:
+            self.data = f.read()
 
-    @property
-    def name(self):
+        self.is_loaded = True
+        return True
 
-        return self.path.name
+    def get_flash_label(self) -> str:
+        """
+        Returns human-readable SPI chip capacity string.
+        """
+        return FLASH_SIZES.get(self.size, f"Custom Dump ({self.size / (1024*1024):.2f} MB)")
 
-    def flash_size(self):
+    def blank_percentage(self) -> float:
+        """
+        Calculates percentage of erased 0xFF bytes (Chip erased / bad dump check).
+        """
+        if not self.data:
+            return 0.0
+        ff_count = self.data.count(b"\xff")
+        return (ff_count / self.size) * 100.0
 
-        flash_sizes = {
-            1 * 1024 * 1024: "1 MB",
-            2 * 1024 * 1024: "2 MB",
-            4 * 1024 * 1024: "4 MB",
-            8 * 1024 * 1024: "8 MB",
-            16 * 1024 * 1024: "16 MB",
-            32 * 1024 * 1024: "32 MB",
-            64 * 1024 * 1024: "64 MB",
-        }
+    def zero_percentage(self) -> float:
+        """
+        Calculates percentage of 0x00 bytes (Zero-filled / programmer failure check).
+        """
+        if not self.data:
+            return 0.0
+        zero_count = self.data.count(b"\x00")
+        return (zero_count / self.size) * 100.0
 
-        return flash_sizes.get(self.size, "Unknown")
+    def extract_slice(self, start_offset: int, length: int) -> Optional[bytes]:
+        """
+        Extracts a safe byte slice from the firmware buffer.
+        """
+        if start_offset < 0 or start_offset >= self.size:
+            return None
+        
+        end_offset = start_offset + length
+        if end_offset > self.size:
+            end_offset = self.size
 
-    def count_ff(self):
-
-        return self.data.count(0xFF)
-
-    def count_zero(self):
-
-        return self.data.count(0x00)
-
-    def blank_percentage(self):
-
-        if self.size == 0:
-            return 0
-
-        return round((self.count_ff() / self.size) * 100, 2)
-
-    def zero_percentage(self):
-
-        if self.size == 0:
-            return 0
-
-        return round((self.count_zero() / self.size) * 100, 2)
+        return self.data[start_offset:end_offset]
