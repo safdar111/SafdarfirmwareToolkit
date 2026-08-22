@@ -149,8 +149,8 @@ class PasswordRemovalTab(QWidget):
                 self.log_view.append(f"[i] TIP: Open both files in HxD to inspect modified bytes.")
                 QMessageBox.information(self, "Success", f"{message}\n\nFile is ready for HxD comparison:\n{save_path}")
             else:
-                self.log_view.append(f"[-] Scan Result: {message}")
-                self.log_view.append(f"[-] No password/flags cleared. Original file is clean.")
+                self.log_view.append(f"[-] Scan Result:\n{message}")
+                self.log_view.append(f"[i] No bytes were modified.")
                 if os.path.exists(save_path):
                     os.remove(save_path)
                 QMessageBox.information(self, "Analysis Result", message)
