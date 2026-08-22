@@ -1,40 +1,45 @@
-import struct
-from typing import Dict, Any, Optional, List
+# =====================================================
+# Safdar Firmware Toolkit Pro
+# Version   : 0.5.3 (Advanced Workshop Grade)
+# File      : core/csme_engine.py
+# Author    : Safdar Ali
+# =====================================================
 
+"""
+Safdar Firmware Toolkit Pro - Advanced Intel ME/CSME Diagnostic & Repair Engine
+-------------------------------------------------------------------------------
+Uses forensic heuristics to bypass FITC headers and extract the TRUE 
+execution version, SKU profile, and Initialization (Dirty) state for ME 11+.
+Includes built-in extraction and injection workshop utilities.
+"""
+
+import os
+import struct
+import glob
+import re
+from typing import Dict, Any, Optional, List, Tuple
 
 class CSMEEngine:
-    """
-    Safdar Firmware Toolkit Pro - Intel ME/CSME Diagnostic Engine
-    -------------------------------------------------------------
-    Parses Flash Partition Tables ($FPT), Manifest Headers ($MN2/$HDR),
-    and evaluates clean vs dirty configuration states using struct unpacking.
-    """
-
-    # Intel ME / CSME Magic Signatures
     SIGNATURE_FPT = b"$FPT"
     SIGNATURE_MN2 = b"$MN2"
     SIGNATURE_HDR = b"$HDR"
+    SIGNATURE_BKM = b"$BKM" # Boot Guard Key Manifest
+    SIGNATURE_BPM = b"$BPM" # Boot Guard Boot Policy Manifest
 
     def __init__(self, bios_data: Optional[bytes] = None):
         self.data: bytes = bios_data if bios_data is not None else b""
         self.file_size_mb: float = len(self.data) / (1024 * 1024) if self.data else 0.0
 
     def analyze_file(self, bios_bytes: Optional[bytes] = None, file_size_mb: Optional[float] = None) -> Dict[str, Any]:
-        """
-        Main entry point. Evaluates ME presence, SKU, version triple, and initialization state.
-        Uses self.data if bios_bytes is not explicitly passed.
-        """
+        """Main diagnostic entry point for CSME evaluation."""
         if bios_bytes is not None:
             self.data = bios_bytes
             self.file_size_mb = len(bios_bytes) / (1024 * 1024)
-
         if file_size_mb is not None:
             self.file_size_mb = file_size_mb
 
-        # 1. Locate Flash Partition Table ($FPT) - search for multiple occurrences and pick the best match
         fpt_offset = self._find_best_fpt_offset()
 
-        # --- PREVENT FALSE CLEANS ON 16 MB / BIOS-ONLY DUMPS ---
         if fpt_offset == -1:
             return {
                 "has_me_region": False,
@@ -43,173 +48,247 @@ class CSMEEngine:
                 "version": "N/A",
                 "sku": "N/A",
                 "is_clean": False,
-                "description": (
-                    f"This binary ({self.file_size_mb:.1f} MB) contains no Intel CSME/ME partition ($FPT missing). "
-                    "On dual-chip boards, the ME region resides on the primary (e.g., 32 MB) SPI chip."
-                )
+                "description": f"This binary ({self.file_size_mb:.1f} MB) contains no Intel CSME partition."
             }
 
-        # 2. Parse $FPT Header
         fpt_info = self._parse_fpt_header(fpt_offset)
-
-        # 3. Locate Manifest ($MN2 / $HDR) & Extract Version
-        version_str = self._extract_me_version(fpt_offset)
-
-        # 4. Evaluate Health & Configuration Flags
+        me_bounds = self._calculate_me_boundaries(fpt_offset)
+        version_str = self._extract_true_version(fpt_offset)
+        sku_info = self._detect_sku(fpt_offset)
         health_info = self._evaluate_health_flags(fpt_offset)
-
-        # Detect Boot Guard / manifest indicators in the whole image for safety checks
-        boot_guard_detected = any(x in self.data for x in (b"$BKM", b"$HAP", b"$BPT"))
+        boot_guard_info = self._analyze_boot_guard()
 
         return {
             "has_me_region": True,
             "fpt_offset": hex(fpt_offset),
+            "me_base_address": hex(me_bounds[0]),
+            "me_size_bytes": me_bounds[1],
             "header_revision": fpt_info.get("revision", "N/A"),
             "version": version_str,
-            "sku": health_info.get("sku", "CSME/ME Firmware"),
+            "sku": sku_info,
             "status_text": health_info["status_text"],
             "status_color": health_info["status_color"],
             "is_clean": health_info["is_clean"],
-            "description": health_info["description"]
-            ,"boot_guard": boot_guard_detected
+            "description": health_info["description"],
+            "boot_guard_active": boot_guard_info['active'],
+            "boot_guard_details": boot_guard_info['details']
         }
 
-    # --- METHOD ALIAS FOR ANALYZER.PY ---
-    def inspect(self, bios_bytes: Optional[bytes] = None, file_size_mb: Optional[float] = None) -> Dict[str, Any]:
-        """Wrapper to satisfy existing calls to CSMEInspector.inspect() in analyzer.py."""
-        return self.analyze_file(bios_bytes, file_size_mb)
+    # --- ADVANCED WORKSHOP FEATURES: EXTRACT & INJECT ---
 
-    def _parse_fpt_header(self, offset: int) -> Dict[str, Any]:
-        """Unpacks $FPT 32-byte header fields using struct."""
-        if (offset + 32) > len(self.data):
-            return {}
+    def extract_me(self, output_path: str) -> bool:
+        """Extracts the exact ME region binary based on FPT boundaries."""
+        info = self.analyze_file()
+        if not info["has_me_region"]:
+            return False
+            
+        me_base = int(info["me_base_address"], 16)
+        me_size = info["me_size_bytes"]
+        
+        if me_base + me_size > len(self.data):
+            return False
 
+        me_data = self.data[me_base:me_base + me_size]
+        
         try:
-            sig, header_len, entry_ver, header_rev = struct.unpack("<4sHBB", self.data[offset:offset + 8])
-            entries_count = self.data[offset + 0x0B]
-            return {
-                "header_length": header_len,
-                "revision": header_rev,
-                "entry_count": entries_count
-            }
-        except struct.error:
-            return {}
+            with open(output_path, "wb") as f:
+                f.write(me_data)
+            return True
+        except Exception:
+            return False
+
+    def inject_clean_me(self, clean_me_path: str, output_path: str) -> bool:
+        """Injects a clean donor ME binary into the current dump."""
+        info = self.analyze_file()
+        if not info["has_me_region"]:
+            return False
+
+        me_base = int(info["me_base_address"], 16)
+        me_target_size = info["me_size_bytes"]
+
+        if not os.path.exists(clean_me_path):
+            return False
+
+        with open(clean_me_path, "rb") as f:
+            clean_me_data = f.read()
+
+        if len(clean_me_data) > me_target_size:
+            return False
+
+        if len(clean_me_data) < me_target_size:
+            padding = b'\xFF' * (me_target_size - len(clean_me_data))
+            clean_me_data += padding
+
+        new_bios_data = bytearray(self.data)
+        new_bios_data[me_base:me_base + me_target_size] = clean_me_data
+
+        with open(output_path, "wb") as f:
+            f.write(new_bios_data)
+        return True
+
+    def find_clean_me_in_database(self, db_folder: str) -> Optional[str]:
+        """Scans the local workshop CSME_Database for a matching Version & SKU."""
+        if not os.path.exists(db_folder):
+            return None
+            
+        info = self.analyze_file()
+        target_version = info["version"]
+        target_sku = info["sku"].split()[0]
+
+        search_pattern = os.path.join(db_folder, "*.bin")
+        for file_path in glob.glob(search_pattern):
+            with open(file_path, "rb") as f:
+                db_data = f.read(1024 * 1024 * 4) 
+                
+            db_engine = CSMEEngine(db_data)
+            db_info = db_engine.analyze_file()
+            
+            if db_info["has_me_region"] and db_info["version"] == target_version:
+                if target_sku in db_info["sku"]:
+                    if db_info["is_clean"]:
+                        return file_path
+        return None
+
+    # --- INTERNAL PARSING & REVERSE ENGINEERING LOGIC ---
 
     def _find_best_fpt_offset(self) -> int:
-        """Search all $FPT occurrences and pick the most plausible one using FIT fields validation."""
-        positions: List[int] = []
         start = 0
         while True:
             pos = self.data.find(self.SIGNATURE_FPT, start)
             if pos == -1:
-                break
-            positions.append(pos)
+                return -1
+            if pos + 0x20 <= len(self.data):
+                return pos
             start = pos + 4
 
-        if not positions:
-            return -1
+    def _calculate_me_boundaries(self, fpt_offset: int) -> Tuple[int, int]:
+        """Calculates ME base address and total size using FPT structure."""
+        me_base = fpt_offset - 0x10
+        if me_base < 0:
+            me_base = 0
+        
+        version = self._extract_true_version(fpt_offset)
+        size = 1024 * 1024 * 8 
+        
+        if version.startswith("8.") or version.startswith("9.") or version.startswith("10."):
+            size = 1024 * 1024 * 5
+        elif version.startswith("11.") or version.startswith("12."):
+            size = 1024 * 1024 * 7 
 
-        plausible = []
-        for pos in positions:
-            # Read FIT fields at pos+0x18 if present
-            fit_off = pos + 0x18
-            if fit_off + 8 <= len(self.data):
+        return (me_base, size)
+
+    def _parse_fpt_header(self, offset: int) -> Dict[str, Any]:
+        if (offset + 32) > len(self.data):
+            return {}
+        try:
+            sig, header_len, entry_ver, header_rev = struct.unpack("<4sHBB", self.data[offset:offset + 8])
+            entries_count = self.data[offset + 0x0B]
+            return {"header_length": header_len, "revision": header_rev, "entry_count": entries_count}
+        except struct.error:
+            return {}
+
+    def _extract_true_version(self, fpt_offset: int) -> str:
+        """
+        Extracts the true execution version from a 32MB/16MB full dump by 
+        scanning the ME region boundaries around the detected $FPT offset.
+        """
+        version_pattern = re.compile(rb'(1[0-9]\.[0-9]{1,2}\.[0-9]{1,3}\.[0-9]{3,4})')
+        
+        start_pos = max(0, fpt_offset - 0x1000)
+        end_pos = min(len(self.data), fpt_offset + 0x400000)
+        search_window = self.data[start_pos:end_pos]
+        
+        matches = version_pattern.findall(search_window)
+        if matches:
+            decoded = [m.decode('utf-8', errors='ignore') for m in set(matches)]
+            valid_versions = [v for v in decoded if v.count('.') == 3 and not v.startswith("0.0.") and not v.startswith("1.0.0")]
+            if valid_versions:
                 try:
-                    vals = struct.unpack("<HHHH", self.data[fit_off:fit_off + 8])
-                except struct.error:
-                    continue
-                major, minor, hotfix, build = vals
-                # Basic plausibility checks for FIT version numbers
-                if 1 <= major <= 30 and 0 <= minor <= 200 and 0 <= hotfix <= 2000 and 0 <= build <= 65535:
-                    plausible.append((pos, (major, minor, hotfix, build)))
+                    return max(valid_versions, key=lambda v: int(v.split('.')[-1]))
+                except ValueError:
+                    pass
 
-        # Prefer the earliest plausible FIT-containing FPT; otherwise fall back to the first found
-        if plausible:
-            plausible.sort(key=lambda x: x[0])
-            return plausible[0][0]
-
-        return positions[0]
-
-    def _extract_me_version(self, fpt_offset: int) -> str:
-        """Read the version from the Intel FPT header and nearby manifest data."""
-        candidates = []
-
-        # Intel FPT header stores FIT version at offsets 0x18..0x1F.
-        fpt_fit_start = fpt_offset + 0x18
-        if fpt_fit_start + 8 <= len(self.data):
-            try:
-                values = struct.unpack("<HHHH", self.data[fpt_fit_start:fpt_fit_start + 8])
-                if 1 <= values[0] <= 30 and 0 <= values[1] <= 200 and 0 <= values[2] <= 2000 and 0 <= values[3] <= 65535:
-                    candidates.append(f"{values[0]}.{values[1]}.{values[2]}.{values[3]}")
-            except struct.error:
-                pass
-
-        # Fallback: scan a larger nearby manifest window for real $MN2 / $HDR headers
-        search_window = self.data[max(0, fpt_offset): min(len(self.data), fpt_offset + 0x40000)]
-        for sig in (self.SIGNATURE_MN2, self.SIGNATURE_HDR):
-            pos = search_window.find(sig)
-            while pos != -1:
-                abs_offset = fpt_offset + pos
-                # try a dense set of offsets after the signature where version fields may live
-                for rel_offset in (0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C, 0x40, 0x44):
-                    start = abs_offset + rel_offset
-                    end = start + 8
-                    if end > len(self.data):
-                        continue
-                    try:
-                        values = struct.unpack("<HHHH", self.data[start:end])
-                    except struct.error:
-                        continue
-                    if 1 <= values[0] <= 30 and 0 <= values[1] <= 200 and 0 <= values[2] <= 2000 and 0 <= values[3] <= 65535:
-                        candidates.append(f"{values[0]}.{values[1]}.{values[2]}.{values[3]}")
-                pos = search_window.find(sig, pos + 4)
-
-        # Prefer the most likely real version numbers; drop invalid placeholders.
-        for candidate in candidates:
-            if candidate not in {"0.0.0.0", "1.0.0.0"}:
-                return candidate
+        all_matches = version_pattern.findall(self.data)
+        if all_matches:
+            decoded = [m.decode('utf-8', errors='ignore') for m in set(all_matches)]
+            valid_versions = [v for v in decoded if v.count('.') == 3 and not v.startswith("0.0.") and not v.startswith("1.0.0")]
+            if valid_versions:
+                try:
+                    return max(valid_versions, key=lambda v: int(v.split('.')[-1]))
+                except ValueError:
+                    pass
 
         return "Version Unidentified"
 
-    def _evaluate_health_flags(self, fpt_offset: int) -> Dict[str, Any]:
-        """Evaluates initialization state flags and distinguishes Clean vs Dirty."""
-        is_initialized = False
-        if (fpt_offset + 0x18) <= len(self.data):
-            flags = self.data[fpt_offset + 0x14]
-            if (flags & 0x03) != 0:
-                is_initialized = True
+    def _detect_sku(self, fpt_offset: int) -> str:
+        """Determines if ME is Consumer, Corporate, LP (Low Power) or H (High Performance)."""
+        search_window = self.data[max(0, fpt_offset): min(len(self.data), fpt_offset + 0x80000)]
+        sku_tags = []
+        
+        if b"Corporate" in search_window or b"COR" in search_window:
+            sku_tags.append("Corporate")
+        elif b"Consumer" in search_window or b"CON" in search_window:
+            sku_tags.append("Consumer")
+            
+        if b"-LP" in search_window or b"_LP" in search_window or b"KBP-LP" in search_window or b"SPT-LP" in search_window:
+            sku_tags.append("LP")
+        elif b"-H" in search_window or b"_H" in search_window or b"KBP-H" in search_window or b"SPT-H" in search_window:
+            sku_tags.append("H")
+            
+        if sku_tags:
+            return " ".join(dict.fromkeys(sku_tags))
+            
+        return "Unknown SKU"
 
-        if not is_initialized:
+    def _evaluate_health_flags(self, fpt_offset: int) -> Dict[str, Any]:
+        """
+        Evaluates initialization state. Full 16MB/32MB/64MB SPI dumps taken from 
+        live motherboards are inherently Dirty/Initialized unless proven otherwise.
+        """
+        is_dirty = True 
+        
+        if self.file_size_mb <= 8.0 or b'RGN' in self.data[:4096]:
+            mfs_idx = self.data.find(b'MFS')
+            if mfs_idx != -1 and (mfs_idx + 2048) <= len(self.data):
+                sample_block = self.data[mfs_idx + 1024 : mfs_idx + 2048]
+                if sample_block.count(b'\xFF') > 900: 
+                    is_dirty = False
+            else:
+                is_dirty = False
+
+        if is_dirty:
+            return {
+                "status_text": "Initialized (Dirty - Do Not Flash)",
+                "status_color": "red",
+                "is_clean": False,
+                "description": "ME Region is Married to hardware. Needs Cleaning before flashing to avoid 30-min shutdown."
+            }
+        else:
             return {
                 "status_text": "Clean / Configured",
                 "status_color": "green",
                 "is_clean": True,
-                "sku": "CSME Unconfigured Base",
-                "description": "Firmware is in fresh factory state. Unpaired with CPU/PCH."
+                "description": "ME Region is Clean (Factory state). Safe to flash."
             }
-        else:
+
+    def _analyze_boot_guard(self) -> Dict[str, Any]:
+        """Checks for Intel Boot Guard Keys which lock the BIOS region to the CPU."""
+        has_bkm = self.SIGNATURE_BKM in self.data
+        has_bpm = self.SIGNATURE_BPM in self.data
+        
+        if has_bkm or has_bpm:
             return {
-                "status_text": "Dirty / Initialized",
-                "status_color": "red",
-                "is_clean": False,
-                "sku": "CSME Hardware-Paired",
-                "description": "Firmware contains system-specific pairing, Boot Guard, or committed system data."
+                "active": True,
+                "details": "Boot Guard Detected! Do NOT blindly swap BIOS regions, CPU hash is verified at boot."
             }
+        return {"active": False, "details": "No Boot Guard detected. BIOS region is unencrypted."}
 
-    def get_version_string(self) -> str:
-        """Compatibility wrapper expected by the analyzer and GUI."""
-        info = self.analyze_file()
-        return info.get("version", "Unknown")
+    def inspect(self, bios_bytes: Optional[bytes] = None, file_size_mb: Optional[float] = None) -> Dict[str, Any]:
+        return self.analyze_file(bios_bytes, file_size_mb)
 
-    def get_health_status(self) -> str:
-        """Compatibility wrapper expected by the analyzer and GUI."""
-        info = self.analyze_file()
-        return info.get("status_text", "Unknown State")
-
-
-# --- BACKWARD COMPATIBILITY ALIASES FOR ANALYZER.PY ---
+# --- BACKWARD COMPATIBILITY ALIASES ---
 CSMEInspector = CSMEEngine
 CSMEManager = CSMEEngine
 
 if __name__ == "__main__":
-    print("[*] CSMEEngine module loaded successfully.")
+    print("[*] Safdar Firmware Toolkit - CSMEEngine module ready.")

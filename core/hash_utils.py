@@ -1,18 +1,19 @@
 # =====================================================
 # Safdar Firmware Toolkit Pro
-# Version : 0.3.0
-# File    : core/hash_utils.py
-# Author  : Safdar Ali
+# Version   : 0.4.0 (Workshop Grade)
+# File      : core/hash_utils.py
+# Author    : Safdar Ali
 # =====================================================
 
 """
 Streamed Hashing Engine.
-Calculates MD5, SHA1, SHA256, and CRC32 checksums for firmware verification.
+Calculates MD5, SHA1, SHA256, and CRC32 checksums for firmware verification,
+including specific block/region hashing for Donor vs Original comparison.
 """
 
 import hashlib
 import zlib
-from typing import Dict
+from typing import Dict, Optional
 
 
 def calculate_hashes(data: bytes) -> Dict[str, str]:
@@ -38,6 +39,21 @@ def calculate_hashes(data: bytes) -> Dict[str, str]:
         "sha256": sha256,
         "crc32": crc32,
     }
+
+
+def calculate_region_hashes(data: bytes, start_offset: int, length: int) -> Dict[str, str]:
+    """
+    Workshop Feature: Hashes a specific region (like NVRAM or ME block).
+    Extremely useful for comparing Donor and Original sections byte-by-byte 
+    without saving them to disk first.
+    """
+    if not data or start_offset < 0 or start_offset + length > len(data):
+        return {
+            "md5": "Error", "sha1": "Error", "sha256": "Error", "crc32": "Error"
+        }
+    
+    region_slice = data[start_offset:start_offset + length]
+    return calculate_hashes(region_slice)
 
 
 def calculate_file_hashes(file_path: str) -> Dict[str, str]:
@@ -73,3 +89,16 @@ def calculate_file_hashes(file_path: str) -> Dict[str, str]:
             "sha256": "Error Reading File",
             "crc32": "Error Reading File",
         }
+
+
+def verify_file_integrity(file_path: str, expected_hash: str, algo: str = "sha256") -> bool:
+    """
+    Workshop Feature: Checks if a downloaded/donor file matches its known good hash.
+    Helps prevent writing corrupted donor files to the motherboard.
+    """
+    hashes = calculate_file_hashes(file_path)
+    actual_hash = hashes.get(algo.lower(), "")
+    return actual_hash.lower() == expected_hash.lower()
+
+if __name__ == "__main__":
+    print("[*] Safdar Firmware Toolkit - Hashing Engine Loaded.")

@@ -1,14 +1,14 @@
 # =====================================================
 # Safdar Firmware Toolkit Pro
-# Version : 0.3.0
-# File    : core/descriptor.py
-# Author  : Safdar Ali
+# Version   : 0.5.0 (Workshop Grade)
+# File      : core/descriptor.py
+# Author    : Safdar Ali
 # =====================================================
 
 """
 Intel Flash Descriptor (IFD) Engine.
 Parses Descriptor signatures, FLMAP region boundaries (BIOS, ME, GbE, PDR),
-and flash master access permissions.
+and extracts Master Access permissions to determine IFD Lock status.
 """
 
 from typing import Dict, Any, Optional
@@ -18,7 +18,7 @@ from core.search import hex_offset
 
 class IntelDescriptor:
     """
-    Parses Intel SPI Flash Descriptor structures.
+    Parses Intel SPI Flash Descriptor structures and security locks.
     """
 
     def __init__(self, data: bytes):
@@ -27,11 +27,13 @@ class IntelDescriptor:
         self.offset = -1
         self.flmap0 = 0
         self.flmap1 = 0
+        self.is_locked = True # Default to secure state
         self.regions: Dict[str, Dict[str, Any]] = {}
 
     def analyze(self) -> "IntelDescriptor":
         """
-        Scans for descriptor signature and extracts region map offsets.
+        Scans for descriptor signature, extracts region map offsets, 
+        and evaluates Master Access permissions.
         """
         if not self.data or len(self.data) < 0x1000:
             self.present = False
@@ -43,6 +45,7 @@ class IntelDescriptor:
             self.present = True
             self.offset = idx
             self._parse_regions()
+            self._check_access_permissions()
         else:
             self.present = False
 
@@ -53,7 +56,6 @@ class IntelDescriptor:
         Extracts region base and limit addresses from FLREG registers.
         """
         # FLMAP0 base pointer is located at offset + 0x04
-        # Standard descriptor layout maps regions at descriptor offset + 0x40
         reg_base = self.offset + 0x40
 
         if len(self.data) < reg_base + 20:
@@ -88,12 +90,42 @@ class IntelDescriptor:
                     "end_hex": hex_offset(end_addr),
                 }
 
+    def _check_access_permissions(self) -> None:
+        """
+        Reads FLMAP1 to locate the Flash Master base and determines 
+        if the BIOS/CPU has write access to the ME region.
+        """
+        flmap1_offset = self.offset + 0x08
+        if flmap1_offset + 4 > len(self.data):
+            return
+
+        flmap1_val = int.from_bytes(self.data[flmap1_offset:flmap1_offset + 4], "little")
+        master_base = (flmap1_val & 0xFF) << 4
+        
+        fmba_offset = self.offset + master_base
+        if fmba_offset + 4 > len(self.data):
+            return
+
+        # Flash Master 1 (CPU/BIOS) is the first 32-bit register at FMBA
+        fm1_val = int.from_bytes(self.data[fmba_offset:fmba_offset + 4], "little")
+        
+        # Check if CPU Write Access (Bits 20-23) to Region 2 (ME) is granted
+        # If the specific bit for ME region write is set, it is unlocked.
+        # Otherwise, the IFD is locked.
+        me_write_access = (fm1_val >> 20) & 0x04 
+        
+        if me_write_access:
+            self.is_locked = False
+        else:
+            self.is_locked = True
+
     def status(self) -> str:
         """
-        Returns descriptor status summary string.
+        Returns descriptor status summary string including lock state.
         """
         if self.present:
-            return f"Valid Intel Flash Descriptor Found at {hex_offset(self.offset)}"
+            lock_state = "LOCKED" if self.is_locked else "UNLOCKED"
+            return f"Valid Intel IFD Found at {hex_offset(self.offset)} [{lock_state}]"
         return "No Intel Flash Descriptor (Non-Intel / AMD / Descriptored SPI)"
 
     def offset_hex(self) -> str:

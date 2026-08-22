@@ -1,3 +1,9 @@
+.venv/
 __pycache__/
 *.pyc
-.vscode/
+build/
+*.spec
+buildlog.txt
+*.bin
+*.rom
+*.fd

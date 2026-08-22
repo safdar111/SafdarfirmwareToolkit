@@ -1,6 +1,5 @@
 import re
 
-
 class DMIEngine:
     """
     Robust raw-firmware DMI metadata extractor for BIOS/SPI dumps.
@@ -29,7 +28,6 @@ class DMIEngine:
         upper = cleaned.upper()
         if "BACKUP" in upper or "PHASE" in upper or "PLACEHOLDER" in upper or "TEST" in upper:
             return True
-        # Common placeholder / default tokens seen in dumped firmware
         if any(tok in upper for tok in ("NOTPROVIDED", "UNKNOWN", "DEFAULT", "VOID", "N/A", "REMOVE", "REPLACE")):
             return True
         if upper.startswith("CNZZ") or "ZZZZ" in upper or "MMMM" in upper:
@@ -38,7 +36,6 @@ class DMIEngine:
             return True
         if upper in {"MBSIGNED", "MBXFERERROR", "MBTRANSFER", "MBERROR", "MBTEST"}:
             return True
-        # Reject very short or obviously synthetic sequences like "000000" or "XXXX"
         if re.fullmatch(r"[0-9]{2,}$", upper) and len(upper) < 6:
             return True
         return False
@@ -47,7 +44,6 @@ class DMIEngine:
         for pattern in patterns:
             match = re.search(pattern, self.data, re.IGNORECASE)
             if match:
-                # Prefer a capture group if the pattern defines one
                 candidate_raw = match.group(1) if match.lastindex else match.group(0)
                 candidate = self._clean_text(candidate_raw)
                 if not self._is_placeholder(candidate):
@@ -55,16 +51,6 @@ class DMIEngine:
         return "Not Found"
 
     def extract_silk_screen_board_number(self) -> str:
-        """
-        Finds common laptop board silk-screen identifiers across OEMs.
-
-        Examples:
-          - HP/Inspiron/EliteBook: 6050A3136201-MB-A01 or 6050A3136201
-          - Compal: LA-K091P
-          - Quanta: DA0ZK3MB6E0
-          - Lenovo: NM-xxxx
-          - Asus: E1616A, M2N, etc. (partial support)
-        """
         filename_patterns = [
             rb"6050A\d{6,10}",
             rb"6050A\d{6,8}-MB-[A-Z0-9]{2,3}",
@@ -84,10 +70,8 @@ class DMIEngine:
                 if match:
                     candidate = self._clean_text(match.group(0))
                     if candidate and not self._is_placeholder(candidate):
-                        # Allow only likely OEM board patterns; reject generic MB* text fragments.
                         if re.search(r"(?:6050A|DA0|LA-|NM-|DDA30)", candidate.upper()):
                             return candidate.upper()
-            # Explicit filename fallback for exact HP family style.
             hp_match = re.search(r"6050A\d{6,10}", source_upper)
             if hp_match:
                 return hp_match.group(0).upper()
@@ -123,7 +107,6 @@ class DMIEngine:
         return self._first_match(patterns)
 
     def extract_hp_bid(self) -> str:
-        """Extracts HP Board ID (BID) from BIOS/SPI dumps."""
         patterns = [
             rb"BID[0-9A-Fa-f]{5,8}",
             rb"\$HP\$[^A-Z0-9]{0,8}[A-Z0-9]{6,12}",
@@ -138,7 +121,6 @@ class DMIEngine:
                 cleaned = self._clean_text(value)
                 if not cleaned or self._is_placeholder(cleaned):
                     continue
-                # Normalize common BID prefixes
                 up = cleaned.upper()
                 if up.startswith("BID") and len(up) >= 6:
                     return up
@@ -157,16 +139,12 @@ class DMIEngine:
         return "Not Found"
 
     def extract_hp_bid_short(self) -> str:
-        """Extract short numeric HP BID/revision codes often embedded near $HP$ or 'BID' markers (e.g., 0802)."""
-        # Search for explicit BID: #### or three/four digit codes near HP markers
-        # 1) patterns like BID[:=] ####
         match = re.search(rb"(?:BID\s*[:=\-]?\s*)([0-9]{3,4})", self.data, re.IGNORECASE)
         if match:
             val = self._clean_text(match.group(1))
             if val and not self._is_placeholder(val):
                 return val
 
-        # 2) look near $HP$ marker for a short numeric sequence
         hp_idx = self.data.find(b"$HP$")
         if hp_idx != -1:
             window = self.data[max(0, hp_idx - 32): min(self.size, hp_idx + 64)]
@@ -176,7 +154,6 @@ class DMIEngine:
                 if val and not self._is_placeholder(val):
                     return val
 
-        # 3) fallback: look for patterns like 'REV 0802' or 'R0802' in the whole image
         for pattern in (rb"REV\s*([0-9]{3,4})", rb"R([0-9]{3,4})\b"):
             m = re.search(pattern, self.data, re.IGNORECASE)
             if m:
@@ -187,7 +164,6 @@ class DMIEngine:
         return "Not Found"
 
     def extract_dell_service_tag(self) -> str:
-        """Extracts Dell service tag only when Dell-specific context is present."""
         patterns = [
             rb"(?:dell\s*service\s*tag|service\s*tag|dell\s*s\/n|service\s*number)\s*[:=\-]*\s*([A-Z0-9]{5,7})",
             rb"(?:dell)[^A-Z0-9]{0,20}([A-Z0-9]{5,7})",
@@ -195,22 +171,18 @@ class DMIEngine:
         ]
 
         seen = set()
-        # Determine explicit Dell context: filename or nearby text
         has_dell_hint = False
         if self.source_name and "DELL" in self.source_name.upper():
             has_dell_hint = True
+            
         for pattern in patterns:
             for match in re.finditer(pattern, self.data, re.IGNORECASE):
                 tag = match.group(1) if match.lastindex else match.group(0)
                 tag = self._clean_text(tag)
-                if not tag:
-                    continue
-                if self._is_placeholder(tag):
+                if not tag or self._is_placeholder(tag):
                     continue
                 if len(tag) in (5, 6, 7) and re.fullmatch(r"[A-Z0-9]+", tag):
-                    # Only return if explicit Dell context is present or filename hints Dell
                     if not has_dell_hint:
-                        # scan a small window around the match for the word 'dell'
                         start = max(0, match.start() - 64)
                         end = min(self.size, match.end() + 64)
                         window = self._clean_text(self.data[start:end])
@@ -219,12 +191,54 @@ class DMIEngine:
                     if tag not in seen and not re.match(r"^[0-9]+$", tag):
                         seen.add(tag)
                         return tag.upper()
+        return "Not Found"
 
-        # Explicit Dell context is required; otherwise skip generic 5-7 char tokens.
+    def extract_lenovo_identifiers(self) -> dict:
+        """Extracts Lenovo specific Machine Type Model (MTM) and UUID."""
+        lenovo_info = {"mtm": "Not Found", "uuid": "Not Found"}
+        
+        # MTM commonly looks like 20L5CTO1WW (ThinkPad) or 81Y4001FUS (IdeaPad)
+        mtm_patterns = [
+            rb"(?:MTM|Machine\s*Type)\s*[:=\-]*\s*([A-Z0-9]{10})",
+            rb"(?:ThinkPad|IdeaPad|Lenovo)[^A-Z0-9]{0,30}([0-9]{2}[A-Z]{1}[0-9A-Z]{7})"
+        ]
+        
+        for pattern in mtm_patterns:
+            match = re.search(pattern, self.data, re.IGNORECASE)
+            if match:
+                val = self._clean_text(match.group(1)).upper()
+                if not self._is_placeholder(val) and len(val) == 10:
+                    lenovo_info["mtm"] = val
+                    break
+                    
+        return lenovo_info
+
+    def extract_mac_address(self) -> str:
+        """
+        Extracts MAC address from the GbE region. 
+        Intel GbE region usually starts right after the 4KB descriptor (0x1000 or 0x2000).
+        The first 6 bytes of the GbE region represent the MAC address.
+        """
+        if self.size < 0x2000:
+            return "Not Found (File too small)"
+            
+        # Check standard IFD GbE offsets
+        potential_offsets = [0x1000, 0x2000]
+        
+        for offset in potential_offsets:
+            if offset + 6 <= self.size:
+                mac_bytes = self.data[offset:offset+6]
+                
+                # Exclude completely empty (FF) or empty (00) MACs
+                if mac_bytes != b'\xff'*6 and mac_bytes != b'\x00'*6:
+                    # Intel MACs often start with specific OUIs, but we'll accept any valid-looking MAC.
+                    # Convert to standard XX:XX:XX:XX:XX:XX format
+                    mac_str = ":".join(f"{b:02X}" for b in mac_bytes)
+                    return mac_str
+                    
         return "Not Found"
 
     def extract_serial_numbers(self) -> dict:
-        """Extracts vendor serials and product key values from raw firmware bytes."""
         serials = {
             "serial_number": "Not Found",
             "model_name": "Not Found",
@@ -271,8 +285,19 @@ class DMIEngine:
 
         return serials
 
+    def _serial_confidence(self, value: str) -> str:
+        if not value or value == "Not Found":
+            return "Low"
+        v = value.strip().upper()
+        if self._is_placeholder(v):
+            return "Low"
+        if re.fullmatch(r'(?:[0-9][A-Z]){3,}', v) or re.fullmatch(r'(?:[A-Z][0-9]){3,}', v):
+            return "Medium"
+        if re.fullmatch(r'(?:([A-Z0-9])\1{3,})', v):
+            return "Low"
+        return "High"
+
     def check_ifd_health(self) -> dict:
-        """Validates the Intel Flash Descriptor signature and layout."""
         if self.size < 0x1000:
             return {"status": "FAIL", "reason": "File too small for descriptor validation"}
 
@@ -286,7 +311,6 @@ class DMIEngine:
         }
 
     def check_intel_boot_guard(self) -> dict:
-        """Checks for Intel Boot Guard manifest markers."""
         if b"$BKM" in self.data or b"$HAP" in self.data or b"$BPT" in self.data:
             return {
                 "status": "ACTIVE / ENFORCED",
@@ -295,15 +319,24 @@ class DMIEngine:
         return {"status": "DISABLED / NOT DETECTED", "note": "Standard boot flow."}
 
     def run_full_diagnostic(self) -> dict:
-        """Returns the main DMI/structural summary used by the analyzer."""
         serials = self.extract_serial_numbers()
+        board = self.extract_silk_screen_board_number()
+        serial_val = serials["serial_number"]
+        lenovo_info = self.extract_lenovo_identifiers()
+        mac_addr = self.extract_mac_address()
+        
         return {
-            "board_number": self.extract_silk_screen_board_number(),
+            "board_number": board,
+            "board_confidence": "High" if board != "Not Found" and not self._is_placeholder(board) else "Low",
             "hp_bid": self.extract_hp_bid(),
-            "hp_bid_short": self.extract_hp_bid_short() ,
+            "hp_bid_short": self.extract_hp_bid_short(),
+            "hp_bid_confidence": "High" if self.extract_hp_bid() != "Not Found" else "Low",
             "dell_tag": self.extract_dell_service_tag(),
-            "serial_number": serials["serial_number"],
+            "serial_number": serial_val,
+            "serial_confidence": self._serial_confidence(serial_val),
             "windows_dpk": serials["windows_dpk"],
+            "lenovo_mtm": lenovo_info["mtm"],
+            "mac_address": mac_addr,
             "ifd_health": self.check_ifd_health(),
             "boot_guard": self.check_intel_boot_guard(),
         }

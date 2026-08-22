@@ -1,11 +1,16 @@
+# =====================================================
+# Safdar Firmware Toolkit Pro
+# Version   : 0.4.0 (Workshop Grade)
+# File      : core/repair_planner.py
+# Author    : Safdar Ali
+# =====================================================
+
 import os
 from typing import Dict, Any
-
 
 class RepairPlanner:
     """
     Workshop-grade donor and chip-role assessment for BIOS repair planning.
-
     This is intentionally conservative: it prefers classifying a dump as
     primary/recovery/backup based on descriptor, volume presence, and size.
     """
@@ -17,61 +22,29 @@ class RepairPlanner:
                 "confidence": "High",
                 "reason": "Valid Intel IFD, ME region, and UEFI volume indicate this is likely the active firmware image.",
             }
-
         if ifd_ok and has_me_region:
             return {
                 "role": "Primary BIOS / candidate active image",
                 "confidence": "Medium",
                 "reason": "Descriptor and ME region are present, but the UEFI volume is not strongly confirmed.",
             }
-
         if file_size <= 2 * 1024 * 1024:
             return {
                 "role": "Recovery / small secondary image",
                 "confidence": "Medium",
                 "reason": "Small flash size often matches recovery or backup firmware rather than the active BIOS image.",
             }
-
         if ifd_ok and not has_me_region:
             return {
                 "role": "Secondary / partial image",
                 "confidence": "Low",
-                "reason": "Descriptor is present but the ME region is missing; this may be a backup, partial, or recovery payload.",
+                "reason": "Descriptor is present but the ME region is missing; this may be a backup, partial, or EC payload.",
             }
 
         return {
             "role": "Unknown / secondary or partial image",
             "confidence": "Low",
             "reason": "No strong evidence for a primary active BIOS image.",
-        }
-
-    def classify_chip_set(self, chip_summaries: list[dict]) -> dict:
-        """Classify multiple chip dumps in a workshop workflow."""
-        ranked = []
-        for idx, chip in enumerate(chip_summaries):
-            role = self.classify_chip_role(
-                file_size=chip.get("file_size", 0),
-                ifd_ok=chip.get("ifd_ok", False),
-                has_me_region=chip.get("has_me_region", False),
-                has_uefi=chip.get("has_uefi", False),
-            )
-            ranked.append({
-                "index": idx,
-                "path": chip.get("path", f"chip_{idx}"),
-                "size": chip.get("file_size", 0),
-                "role": role["role"],
-                "confidence": role["confidence"],
-                "reason": role["reason"],
-            })
-
-        primary = [c for c in ranked if "Primary BIOS" in c["role"]]
-        recovery = [c for c in ranked if "Recovery" in c["role"] or "Secondary" in c["role"] or "Unknown" in c["role"]]
-
-        return {
-            "primary_chip": primary[0] if primary else None,
-            "backup_or_recovery_chips": recovery,
-            "all_chips": ranked,
-            "summary": "Primary chip should be treated as likely active BIOS; secondary/recovery images should not be modified unless explicitly confirmed as active.",
         }
 
     def donor_compatibility(self, original: Dict[str, Any], donor: Dict[str, Any]) -> Dict[str, Any]:
@@ -82,7 +55,7 @@ class RepairPlanner:
 
         score = 0
         details = []
-        # Version proximity scoring (major, minor, hotfix, build)
+        
         def parse_ver(v: str):
             try:
                 parts = [int(x) for x in v.split('.') if x.isdigit() or x.isnumeric()]
@@ -99,7 +72,6 @@ class RepairPlanner:
             score += 45
             details.append("CSME version exact match.")
         else:
-            # major/minor proximity
             if ov[0] and dv[0] and ov[0] == dv[0]:
                 score += 25
                 details.append(f"CSME major version match ({ov[0]}).")
@@ -116,7 +88,6 @@ class RepairPlanner:
             score -= 15
             details.append("Donor looks like a recovery or secondary image; use with caution.")
 
-        # Board number matching: exact strong match, prefix/vendor partial match weaker
         obn = original.get("dmi", {}).get("board_number")
         dbn = donor.get("dmi", {}).get("board_number")
         if obn and dbn:
@@ -124,7 +95,6 @@ class RepairPlanner:
                 score += 25
                 details.append("Board number exact match.")
             else:
-                # vendor prefix match (e.g., DA0, LA-, 6050A)
                 prefixes = ["DA0", "LA-", "6050A", "NM-", "DDA30"]
                 matched_prefix = False
                 for p in prefixes:
@@ -147,30 +117,16 @@ class RepairPlanner:
                 score += 10
                 details.append("HP BID matches.")
 
-        # Short numeric HP BID/revision match (e.g., 0802) - lower weight but useful
-        obn_short = original.get("dmi", {}).get("hp_bid_short")
-        dbn_short = donor.get("dmi", {}).get("hp_bid_short")
-        if obn_short and dbn_short:
-            if str(obn_short) == str(dbn_short):
-                score += 8
-                details.append("HP short BID/revision matches (secondary indicator).")
-
-        # Consider CSME clean/dirty characteristics: if donor is clean and original dirty, favorable
         if donor.get("csme", {}).get("is_clean") and not original.get("csme", {}).get("is_clean"):
             score += 5
             details.append("Donor CSME is clean while original is dirty (useful for repair).")
 
         if score >= 70:
-            verdict = "Compatible / likely safe donor"
+            verdict = "Compatible / safe donor"
         elif score >= 45:
-            verdict = "Possibly compatible / manual review recommended"
+            verdict = "Possibly compatible / review recommended"
         else:
-            verdict = "Incompatible / not recommended for repair"
-
-        if original_role and donor_role and "Primary BIOS" in original_role and "Recovery" in donor_role:
-            verdict = "Incompatible / recovery donor not recommended for active BIOS repair"
-            score = min(score, 35)
-            details.append("Donor is classified as a recovery or secondary image, which is a high-risk mismatch for active BIOS repair.")
+            verdict = "Incompatible / not recommended"
 
         return {
             "score": max(0, min(100, score)),
@@ -180,12 +136,11 @@ class RepairPlanner:
 
     def repair_recommendation(self, original: Dict[str, Any], donor: Dict[str, Any]) -> Dict[str, Any]:
         compat = self.donor_compatibility(original, donor)
-
         recommendation = {
             "preserve": [
                 "Original DMI / SMBIOS data",
                 "Original board identity blocks",
-                "Original serial / service tag / BID blocks",
+                "Original MAC Address (GbE Region)",
                 "Original NVRAM / variable regions when valid",
             ],
             "replace": [
@@ -201,11 +156,61 @@ class RepairPlanner:
             recommendation["warning"] = "Do not proceed without manual confirmation. Donor does not appear to match the target platform closely enough."
         else:
             recommendation["warning"] = "Proceed only after verifying the donor is the active BIOS match and not a recovery or backup image."
-
         return recommendation
 
+    def brand_recommendation(self, original: Dict[str, Any]) -> Dict[str, Any]:
+        board = str(original.get("dmi", {}).get("board_number", "")).upper()
+        hp_bid = str(original.get("dmi", {}).get("hp_bid", "")).upper()
+        combined = f"{board} {hp_bid}".strip()
+
+        if "HP" in combined or "6050A" in combined:
+            return {
+                "brand": "HP",
+                "warning": "HP systems are identity-sensitive (Caps-Lock blink). Do not replace the full image with a random donor. Keep Original BID and DMI.",
+            }
+
+        if "NM-" in combined or "LENOVO" in combined:
+            return {
+                "brand": "Lenovo",
+                "warning": "Lenovo password and identity issues are model-specific. Always transfer Original NVRAM blocks to Donor to preserve MTM and UUID.",
+            }
+
+        if "DELL" in combined or "LA-" in combined:
+             return {
+                "brand": "Dell",
+                "warning": "Dell uses EVSA stores. For passwords with E7A8/8FC8 suffixes, master passwords fail. You MUST rebuild (Frankenstein) using Clean ME and Donor BIOS region.",
+            }
+
+        return {
+            "brand": "Generic",
+            "warning": "Preserve original board identity and use only an exact model-family match. Do not replace the whole image.",
+        }
+
+    def repair_source_priority(self, original: Dict[str, Any], donor: Dict[str, Any] = None, official_exe: bool = False, online_search_allowed: bool = False) -> Dict[str, Any]:
+        brand_guidance = self.brand_recommendation(original)
+
+        if donor is not None:
+            compat = self.donor_compatibility(original, donor)
+            if compat["score"] >= 70:
+                return {
+                    "preferred_source": "Exact donor match",
+                    "priority": 1,
+                    "warning": f"{brand_guidance['warning']} Use only as a region-matching source; keep original identity blocks.",
+                    "risk": "Low to Medium",
+                    "compatibility": compat,
+                    "brand_guidance": brand_guidance,
+                }
+
+        return {
+            "preferred_source": "No safe source available",
+            "priority": -1,
+            "warning": f"{brand_guidance['warning']} No compatible donor available.",
+            "risk": "High",
+            "compatibility": {"score": 0, "verdict": "Unsafe to proceed", "details": ["No verified repair source."]},
+            "brand_guidance": brand_guidance,
+        }
+
     def password_storage_assessment(self, file_size: int, ifd_ok: bool, has_me_region: bool, has_uefi: bool = False) -> Dict[str, Any]:
-        """Determine whether BIOS admin password storage is more likely in the main SPI or a secondary/recovery chip."""
         primary_like = ifd_ok and has_me_region and has_uefi
         if primary_like:
             return {
@@ -213,23 +218,18 @@ class RepairPlanner:
                 "confidence": "High",
                 "reason": "A valid descriptor, ME region, and UEFI image strongly indicate the active BIOS image contains the live platform configuration and password storage area.",
             }
-
-        if ifd_ok and has_me_region:
-            return {
-                "location": "Main SPI / likely active BIOS chip",
-                "confidence": "Medium",
-                "reason": "Descriptor and ME data are present, so password-related NVRAM state is more likely on the primary chip than on a recovery backup chip.",
-            }
-
         if file_size <= 2 * 1024 * 1024:
             return {
-                "location": "Secondary / recovery chip likely",
+                "location": "Secondary / recovery chip likely (Often EC/KBC chip)",
                 "confidence": "Medium",
-                "reason": "Small dumps are often secondary or recovery images; do not assume they hold the primary BIOS password store unless hardware validation confirms it.",
+                "reason": "Small dumps are often secondary or EC images; some old Thinkpads store passwords here, but modern ones use Main SPI.",
             }
 
         return {
             "location": "Unknown / needs board-level confirmation",
             "confidence": "Low",
-            "reason": "This dump does not provide enough evidence to safely assign password storage to the main chip or a secondary chip.",
+            "reason": "This dump does not provide enough evidence to safely assign password storage.",
         }
+
+if __name__ == "__main__":
+    print("[*] Safdar Firmware Toolkit - Repair Planner Ready.")
